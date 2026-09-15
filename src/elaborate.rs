@@ -7786,6 +7786,7 @@ pub fn elaborate_module_with_defs(
     // control, applied at the outermost level. Nested event/timing
     // control in the body is illegal.
     validate_always_ff_event_controls(&elab)?;
+    validate_constant_part_select_bounds(&elab)?;
 
     // IEEE 1800-2017 §13.5.2: arguments to `ref` formals must be
     // variables (i.e. assignable lvalues), not arbitrary expressions.
@@ -8430,6 +8431,173 @@ fn validate_modport_writes(elab: &ElaboratedModule) -> Result<(), String> {
 ///  * §9.2.2.1 plain always: the process must be guaranteed to advance
 ///    simulation time on every iteration, else it is a zero-delay livelock
 ///    (a reference simulator: "always process does not have any delay").
+/// IEEE 1800-2017 §11.5.1: the bounds of a constant part-select `[l:r]`
+/// must be constant expressions; only the indexed forms (`+:` / `-:`) take
+/// a variable base (their WIDTH must still be constant). Every engine used
+/// to evaluate such a bound at run time from the variable's current value.
+fn validate_constant_part_select_bounds(elab: &ElaboratedModule) -> Result<(), String> {
+    use crate::ast::expr::{ExprKind, Expression, RangeKind};
+    use crate::ast::stmt::{Statement, StatementKind};
+
+    fn bound_is_const(e: &Expression, elab: &ElaboratedModule) -> bool {
+        const_eval_i64_with_params(e, Some(&elab.parameters)).is_some()
+    }
+    /// The rule applies to a PACKED vector only. A queue, dynamic, unpacked
+    /// or associative array, and a string, take variable slice bounds
+    /// (§7.10.4, §7.5.2, §6.16), and a base that is not a plain identifier
+    /// (an element or a member) has no type here to decide by, so it is
+    /// left alone.
+    fn packed_base(expr: &Expression, elab: &ElaboratedModule) -> bool {
+        let ExprKind::Ident(h) = &expr.kind else { return false };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return false;
+        }
+        let n = h.path[0].name.name.as_str();
+        !(elab.queue_vars.contains(n)
+            || elab.dynamic_arrays.contains(n)
+            || elab.arrays.contains_key(n)
+            || elab.arrays_2d.contains_key(n)
+            || elab.arrays_nd.contains_key(n)
+            || elab.associative_arrays.contains_key(n)
+            || elab.string_signals.contains(n))
+            && elab.signals.contains_key(n)
+    }
+    fn walk_expr(e: &Expression, elab: &ElaboratedModule) -> Result<(), String> {
+        match &e.kind {
+            ExprKind::RangeSelect { expr, kind, left, right } => {
+                walk_expr(expr, elab)?;
+                walk_expr(left, elab)?;
+                walk_expr(right, elab)?;
+                if !packed_base(expr, elab) {
+                    return Ok(());
+                }
+                match kind {
+                    RangeKind::Constant => {
+                        if !bound_is_const(left, elab) || !bound_is_const(right, elab) {
+                            return Err(format!(
+                                "error: the bounds of a part-select `[l:r]` must be constant \
+                                 expressions; use `[base +: width]` or `[base -: width]` for a \
+                                 variable base (IEEE 1800-2017 §11.5.1) at byte {}",
+                                e.span.start
+                            ));
+                        }
+                    }
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                        if !bound_is_const(right, elab) {
+                            return Err(format!(
+                                "error: the width of an indexed part-select must be a constant \
+                                 expression (IEEE 1800-2017 §11.5.1) at byte {}",
+                                e.span.start
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ExprKind::Unary { operand, .. } => walk_expr(operand, elab),
+            ExprKind::Binary { left, right, .. } => {
+                walk_expr(left, elab)?;
+                walk_expr(right, elab)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                walk_expr(condition, elab)?;
+                walk_expr(then_expr, elab)?;
+                walk_expr(else_expr, elab)
+            }
+            ExprKind::Concatenation(v) => v.iter().try_for_each(|x| walk_expr(x, elab)),
+            ExprKind::Replication { count, exprs } => {
+                walk_expr(count, elab)?;
+                exprs.iter().try_for_each(|x| walk_expr(x, elab))
+            }
+            ExprKind::Call { func, args } => {
+                walk_expr(func, elab)?;
+                args.iter().try_for_each(|x| walk_expr(x, elab))
+            }
+            ExprKind::SystemCall { args, .. } => args.iter().try_for_each(|x| walk_expr(x, elab)),
+            ExprKind::Inside { expr, ranges } => {
+                walk_expr(expr, elab)?;
+                ranges.iter().try_for_each(|x| walk_expr(x, elab))
+            }
+            ExprKind::MemberAccess { expr, .. } => walk_expr(expr, elab),
+            ExprKind::Index { expr, index } => {
+                walk_expr(expr, elab)?;
+                walk_expr(index, elab)
+            }
+            ExprKind::Range(a, b) => {
+                walk_expr(a, elab)?;
+                walk_expr(b, elab)
+            }
+            ExprKind::Paren(x) => walk_expr(x, elab),
+            _ => Ok(()),
+        }
+    }
+    fn walk_stmt(st: &Statement, elab: &ElaboratedModule) -> Result<(), String> {
+        match &st.kind {
+            StatementKind::BlockingAssign { lvalue, rvalue }
+            | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                walk_expr(lvalue, elab)?;
+                walk_expr(rvalue, elab)
+            }
+            StatementKind::Expr(e) => walk_expr(e, elab),
+            StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                walk_expr(condition, elab)?;
+                walk_stmt(then_stmt, elab)?;
+                if let Some(e) = else_stmt {
+                    walk_stmt(e, elab)?;
+                }
+                Ok(())
+            }
+            StatementKind::Case { expr, items, .. } => {
+                walk_expr(expr, elab)?;
+                for it in items {
+                    it.patterns.iter().try_for_each(|x| walk_expr(x, elab))?;
+                    walk_stmt(&it.stmt, elab)?;
+                }
+                Ok(())
+            }
+            StatementKind::For { condition, step, body, .. } => {
+                if let Some(c) = condition {
+                    walk_expr(c, elab)?;
+                }
+                step.iter().try_for_each(|x| walk_expr(x, elab))?;
+                walk_stmt(body, elab)
+            }
+            StatementKind::Foreach { array, body, .. } => {
+                walk_expr(array, elab)?;
+                walk_stmt(body, elab)
+            }
+            StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+                walk_expr(condition, elab)?;
+                walk_stmt(body, elab)
+            }
+            StatementKind::Repeat { count, body } => {
+                walk_expr(count, elab)?;
+                walk_stmt(body, elab)
+            }
+            StatementKind::Forever { body } | StatementKind::ForeverTail { body } => walk_stmt(body, elab),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().try_for_each(|x| walk_stmt(x, elab))
+            }
+            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab),
+            _ => Ok(()),
+        }
+    }
+    for ca in &elab.continuous_assigns {
+        walk_expr(&ca.lhs, elab)?;
+        walk_expr(&ca.rhs, elab)?;
+    }
+    for ab in &elab.always_blocks {
+        walk_stmt(&ab.stmt, elab)?;
+    }
+    for pa in &elab.pending_always {
+        walk_stmt(&pa.source, elab)?;
+    }
+    for ib in elab.initial_blocks.iter().chain(elab.final_blocks.iter()) {
+        walk_stmt(&ib.stmt, elab)?;
+    }
+    Ok(())
+}
+
 fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), String> {
     use crate::ast::decl::AlwaysKind;
     use crate::ast::expr::{ExprKind, NumberLiteral};
