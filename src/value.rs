@@ -1463,6 +1463,20 @@ impl Value {
         }
     }
 
+    /// §11.5.1 select index: `None` when any bit is x or z (such an index
+    /// selects nothing: reads give x, writes are discarded), otherwise the
+    /// value as a signed or unsigned integer per its own type. `to_u64` and
+    /// `to_i64` mask unknown bits to zero and never fail, so every select
+    /// that converted its index through them read or wrote bit 0 when the
+    /// index was unknown.
+    #[inline]
+    pub fn to_index(&self) -> Option<i64> {
+        if self.has_xz() {
+            return None;
+        }
+        self.to_i64()
+    }
+
     /// Convert to i64 (sign-extended if is_signed).
     #[inline]
     pub fn to_i64(&self) -> Option<i64> {

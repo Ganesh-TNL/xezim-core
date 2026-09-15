@@ -1820,7 +1820,10 @@ pub struct ElaboratedModule {
     /// MSB), so the interpreter remaps `sig[i]` → internal bit `(W-1)-i`
     /// (IEEE 1800-2017 §7.4.1, §11.5.1). Default-declared `[N:0]` vectors are
     /// descending and absent here.
-    pub ascending_packed: HashMap<String, u32>,
+    /// Ascending packed vectors (`logic [3:10] a`): declared `(low, high)`
+    /// label bounds. Label `p` lives at physical bit `high - p` (the left
+    /// label is the MSB), so both bounds are needed, not just the width.
+    pub ascending_packed: HashMap<String, (i64, i64)>,
     /// Unpacked dimensions attached to a typedef (`typedef T A[0:3];`), keyed by
     /// typedef name. A variable `A v;` inherits these dims so it elaborates as
     /// an unpacked array (IEEE 1800-2017 §6.18, §7.4). Empty for scalar typedefs.
@@ -5436,10 +5439,10 @@ pub fn elaborate_module_with_defs(
                 // Ascending packed vector (`logic [0:7] pa;`): bit/part selects
                 // index from the MSB end (label 0 = MSB), so the interpreter
                 // remaps `pa[i]` → internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
-                if let Some(w) = packed_ascending_width(&dd.data_type, &elab.parameters) {
+                if let Some(bounds) = packed_ascending_bounds(&dd.data_type, &elab.parameters) {
                     for decl in &dd.declarators {
                         if decl.dimensions.is_empty() {
-                            elab.ascending_packed.insert(decl.name.name.clone(), w);
+                            elab.ascending_packed.insert(decl.name.name.clone(), bounds);
                         }
                     }
                 }
@@ -14614,7 +14617,9 @@ fn eval_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
 /// (`logic [0:7]`, left < right), return its width; else None. Multi-dim
 /// packed (`[0:3][7:0]`) is intentionally excluded — its outer index selects
 /// an element, not a bit, and ascending element ordering is vanishingly rare.
-fn packed_ascending_width(dt: &DataType, params: &HashMap<String, Value>) -> Option<u32> {
+/// `(low, high)` label bounds of a single ascending packed dimension
+/// (`[3:10]` gives `(3, 10)`); `None` for descending or multi-dimensional.
+fn packed_ascending_bounds(dt: &DataType, params: &HashMap<String, Value>) -> Option<(i64, i64)> {
     let dims = match dt {
         DataType::IntegerVector { dimensions, .. } => dimensions,
         DataType::Implicit { dimensions, .. } => dimensions,
@@ -14625,7 +14630,7 @@ fn packed_ascending_width(dt: &DataType, params: &HashMap<String, Value>) -> Opt
         let l = const_eval_i64_with_params(left, Some(params))?;
         let r = const_eval_i64_with_params(right, Some(params))?;
         if l < r {
-            return Some((r - l + 1) as u32);
+            return Some((l, r));
         }
     }
     None
