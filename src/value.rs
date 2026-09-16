@@ -1128,6 +1128,95 @@ impl Value {
         }
     }
 
+    /// Two-state word extraction for any width ≤ 64·`v.len()` (the 128- and
+    /// 512-bit wide islands): fills `v` (little-endian words, unused high
+    /// words zeroed) and returns true iff the value is X/Z-free and
+    /// representable (not fill, not real).
+    pub fn words_if_clean(&self, v: &mut [u64]) -> bool {
+        if self.is_fill || self.is_real || self.width as usize > 64 * v.len() {
+            return false;
+        }
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if *xz_bits != 0 {
+                    return false;
+                }
+                v[0] = *val_bits;
+                for w in &mut v[1..] {
+                    *w = 0;
+                }
+                true
+            }
+            ValueStorage::Wide(bits) => {
+                if bits.any_xz() {
+                    return false;
+                }
+                for (i, w) in v.iter_mut().enumerate() {
+                    *w = bits.val.get(i).copied().unwrap_or(0);
+                }
+                true
+            }
+        }
+    }
+
+    /// Two-state word writeback for any width ≤ 64·`v.len()`: sets the value
+    /// to exactly `v` (X/Z cleared) at the CURRENT width, preserving the
+    /// storage kind. Returns true when the stored value CHANGED. Bits of `v`
+    /// above the width must already be masked by the caller.
+    pub fn set_words(&mut self, v: &[u64]) -> bool {
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let w0 = v.first().copied().unwrap_or(0);
+                let changed = *val_bits != w0 || *xz_bits != 0;
+                *val_bits = w0;
+                *xz_bits = 0;
+                changed
+            }
+            ValueStorage::Wide(bits) => {
+                let nb = bits.nbits;
+                let n = WidePlanes::nwords(nb).min(bits.val.len());
+                let r = (nb % 64) as u64;
+                let mut changed = false;
+                for wi in 0..n {
+                    let mut want = v.get(wi).copied().unwrap_or(0);
+                    if wi + 1 == n && r != 0 {
+                        want &= (1u64 << r) - 1;
+                    }
+                    if bits.val[wi] != want {
+                        bits.val[wi] = want;
+                        changed = true;
+                    }
+                    if bits.xz[wi] != 0 {
+                        bits.xz[wi] = 0;
+                        changed = true;
+                    }
+                }
+                changed
+            }
+        }
+    }
+
+    /// Build an X/Z-free value from little-endian two-state words; bits of
+    /// `v` above `width` are dropped.
+    pub fn from_words(v: &[u64], width: u32) -> Value {
+        if width <= 64 {
+            return Value::from_u64(v.first().copied().unwrap_or(0), width);
+        }
+        let n = WidePlanes::nwords(width);
+        let mut val: Vec<u64> = (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect();
+        let r = width % 64;
+        if r != 0 {
+            val[n - 1] &= (1u64 << r) - 1;
+        }
+        Value {
+            storage: ValueStorage::Wide(Box::new(WidePlanes { val, xz: vec![0; n], nbits: width })),
+            width,
+            is_signed: false,
+            is_real: false,
+            is_fill: false,
+        }
+    }
+
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
