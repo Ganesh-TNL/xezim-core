@@ -1280,8 +1280,8 @@ impl Parser {
         // `disable iff` clause, so BOTH orderings work:
         //   @(posedge clk) disable iff (!rst_n) body   (explicit clock)
         //   disable iff (!rst_n) body                  (default clocking)
-        // Captured as Binary{LogAnd, !guard, body} so the SVA executor can
-        // short-circuit when the guard is true.
+        // Captured as Binary{SvaDisableIff, guard, body}: the executor
+        // cancels every attempt in flight while the guard is true.
         let clk_event = if self.at(TokenKind::At) {
             self.bump(); // @
             let e = if self.at(TokenKind::LParen) {
@@ -1312,20 +1312,18 @@ impl Parser {
         } else {
             None
         };
+        // Property context: `and` / `or` are property operators here
+        // (§16.12.3 / §16.12.4), not event-list separators.
+        let prev_sva = self.in_sva_seq;
+        self.in_sva_seq = true;
         let body_inner = self.parse_expression();
+        self.in_sva_seq = prev_sva;
         let body = if let Some(g) = disable_guard {
             let span = body_inner.span;
-            let not_g = Expression::new(
-                ExprKind::Unary {
-                    op: crate::ast::expr::UnaryOp::LogNot,
-                    operand: Box::new(g),
-                },
-                span,
-            );
             Expression::new(
                 ExprKind::Binary {
-                    op: crate::ast::expr::BinaryOp::LogAnd,
-                    left: Box::new(not_g),
+                    op: crate::ast::expr::BinaryOp::SvaDisableIff,
+                    left: Box::new(g),
                     right: Box::new(body_inner),
                 },
                 span,

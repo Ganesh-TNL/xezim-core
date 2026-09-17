@@ -339,29 +339,11 @@ impl Parser {
                 // `a ##[m:n] b` range form is collapsed to the lower
                 // bound for now.
                 if op == BinaryOp::HashHash {
-                    // Optional `[m:n]` / `[*]` / `[+]` range form: skip
-                    // to the closing bracket and use the first number.
+                    // `##N` or a cycle-delay range `##[m:n]` / `##[m:$]` /
+                    // `##[*]` / `##[+]` (§16.9.2), kept as `Range(lo, hi)`.
                     let count_expr = if self.at(TokenKind::LBracket) {
-                        self.bump();
-                        let lo = if self.at(TokenKind::IntegerLiteral) {
-                            self.parse_prefix()
-                        } else {
-                            // `[*]`/`[+]` — default to 1 cycle.
-                            Expression::new(ExprKind::Number(
-                                crate::ast::expr::NumberLiteral::Integer {
-                                    size: None, signed: false,
-                                    base: crate::ast::expr::NumberBase::Decimal,
-                                    value: "1".to_string(),
-                                    cached_val: std::cell::Cell::new(None),
-                                }), self.span_from(start))
-                        };
-                        while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
-                            self.bump();
-                        }
-                        let _ = self.eat(TokenKind::RBracket);
-                        lo
+                        self.parse_sva_delay_range(start)
                     } else {
-                        // Bare count `##1`.
                         self.parse_prefix()
                     };
                     let rhs = self.parse_expr_bp(r_bp);
@@ -1452,28 +1434,13 @@ impl Parser {
                 let start = self.current().span.start; self.bump();
                 // LRM §16.8: prefix `##N rest` or a cycle-delay RANGE
                 // `##[m:n]` / `##[m:$]` / `##[*]` / `##[+]` (e.g. after `|->`:
-                // `a |-> ##[1:$] b`). Mirror the infix range handling: collapse
-                // the range to its lower bound (the SVA executor is approximate).
+                // `a |-> ##[1:$] b`), kept as `Range(lo, hi)`.
+                // The count is a PRIMARY: `##2 (b)` is a delay of 2 followed
+                // by the sequence `(b)`, not a call `2(b)`.
                 let cycles = if self.at(TokenKind::LBracket) {
-                    self.bump();
-                    let lo = if self.at(TokenKind::IntegerLiteral) {
-                        self.parse_prefix()
-                    } else {
-                        Expression::new(ExprKind::Number(
-                            crate::ast::expr::NumberLiteral::Integer {
-                                size: None, signed: false,
-                                base: crate::ast::expr::NumberBase::Decimal,
-                                value: "1".to_string(),
-                                cached_val: std::cell::Cell::new(None),
-                            }), self.span_from(start))
-                    };
-                    while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
-                        self.bump();
-                    }
-                    let _ = self.eat(TokenKind::RBracket);
-                    lo
+                    self.parse_sva_delay_range(start)
                 } else {
-                    self.parse_expr_bp(30)
+                    self.parse_prefix()
                 };
                 // The next token is either another operand (a bare
                 // sequence) or end-of-expression. We greedily parse one
@@ -1855,6 +1822,49 @@ impl Parser {
         }
         res
     }
+    /// §16.9.2 cycle-delay range after `##`: `[m:n]`, `[m:$]`, `[*]`
+    /// (= `[0:$]`), `[+]` (= `[1:$]`) or a single `[n]`. The opening `[` is
+    /// current. Returns `Range(lo, hi)` (an unbounded `hi` is `Dollar`), or
+    /// the bare count for `[n]`.
+    fn parse_sva_delay_range(&mut self, start: usize) -> Expression {
+        let mk_num = |this: &Self, v: &str| {
+            Expression::new(ExprKind::Number(
+                crate::ast::expr::NumberLiteral::Integer {
+                    size: None, signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }), this.span_from(start))
+        };
+        self.bump(); // `[`
+        let (lo, hi) = if self.at(TokenKind::Star) {
+            self.bump();
+            (mk_num(self, "0"), Some(Expression::new(ExprKind::Dollar, self.span_from(start))))
+        } else if self.at(TokenKind::Plus) {
+            self.bump();
+            (mk_num(self, "1"), Some(Expression::new(ExprKind::Dollar, self.span_from(start))))
+        } else {
+            let lo = self.parse_expr_bp(0);
+            let hi = if self.eat(TokenKind::Colon).is_some() {
+                Some(self.parse_expr_bp(0))
+            } else {
+                None
+            };
+            (lo, hi)
+        };
+        while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
+            self.bump();
+        }
+        let _ = self.eat(TokenKind::RBracket);
+        match hi {
+            Some(hi) => Expression::new(
+                ExprKind::Range(Box::new(lo), Box::new(hi)),
+                self.span_from(start),
+            ),
+            None => lo,
+        }
+    }
+
     fn infix_bp(&self) -> Option<(BinaryOp, u8, u8)> {
         let kind = self.current_kind();
         match kind {
@@ -1874,7 +1884,7 @@ impl Parser {
             // §16.9 sequence `and`/`or` — only inside a property/sequence body
             // (the `in_sva_seq` flag), else `or` is an event-list separator and
             // `and` a gate primitive. Bind just above intersect/below throughout.
-            TokenKind::KwAnd if self.in_sva_seq => Some((BinaryOp::SeqAnd, 4, 5)),
+            TokenKind::KwAnd if self.in_sva_seq => Some((BinaryOp::SvaAnd, 4, 5)),
             TokenKind::KwOr if self.in_sva_seq => Some((BinaryOp::SeqOr, 3, 4)),
             // Logical implication / equivalence (IEEE 1800-2017 Table
             // 11-2): lowest-precedence binary ops, below `||`, above the

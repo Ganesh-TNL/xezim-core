@@ -170,6 +170,13 @@ pub enum BinaryOp {
     /// `Within` (`seq1 within seq2`), `Intersect`, `SeqAnd`/`SeqOr`
     /// (sequence `and`/`or`), `Until`/`SUntil` (`until`/`s_until`).
     Throughout, Within, Intersect, SeqAnd, SeqOr, Until, SUntil,
+    /// Property/sequence keyword `and` (§16.9.5 / §16.12.3). Distinct from
+    /// `SeqAnd`, which the parser uses for cycle-delay CONCATENATION
+    /// (`a ##1 b`).
+    SvaAnd,
+    /// `disable iff (guard) property`: `left` is the guard, `right` the
+    /// property (§16.12).
+    SvaDisableIff,
 }
 
 #[derive(Clone)]

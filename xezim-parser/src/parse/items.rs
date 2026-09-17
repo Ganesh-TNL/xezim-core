@@ -1004,27 +1004,36 @@ impl Parser {
                         self.parse_expression()
                     };
                     // §16.12: optional `disable iff (<expr>)` after the
-                    // clocking event, before the property expression. Consume
-                    // it (parse-accept; the abort condition isn't modelled).
-                    if self.at(TokenKind::KwDisable) && self.peek_kind() == TokenKind::KwIff {
+                    // clocking event, before the property expression; kept
+                    // as `Binary{SvaDisableIff, guard, body}`.
+                    let disable_guard = if self.at(TokenKind::KwDisable)
+                        && self.peek_kind() == TokenKind::KwIff
+                    {
                         self.bump(); // disable
                         self.bump(); // iff
-                        if self.at(TokenKind::LParen) {
-                            self.bump();
-                            let mut depth = 1;
-                            while depth > 0 && !self.at(TokenKind::Eof) {
-                                match self.current_kind() {
-                                    TokenKind::LParen => depth += 1,
-                                    TokenKind::RParen => depth -= 1,
-                                    _ => {}
-                                }
-                                self.bump();
-                            }
-                        }
-                    }
+                        let _ = self.eat(TokenKind::LParen);
+                        let g = self.parse_expression();
+                        let _ = self.eat(TokenKind::RParen);
+                        Some(g)
+                    } else {
+                        None
+                    };
                     self.in_sva_seq = true;
                     let body = self.parse_expression();
                     self.in_sva_seq = false;
+                    let body = if let Some(g) = disable_guard {
+                        let span = body.span;
+                        crate::ast::expr::Expression::new(
+                            crate::ast::expr::ExprKind::Binary {
+                                op: crate::ast::expr::BinaryOp::SvaDisableIff,
+                                left: Box::new(g),
+                                right: Box::new(body),
+                            },
+                            span,
+                        )
+                    } else {
+                        body
+                    };
                     let _ = self.eat(TokenKind::Semicolon);
                     Some(crate::ast::expr::Expression::new(
                         crate::ast::expr::ExprKind::SvaClocked {
