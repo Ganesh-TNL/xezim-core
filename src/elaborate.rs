@@ -17569,8 +17569,11 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
             for_each_sub_expr(filter, f);
         }
         ExprKind::RandomizeWith { call, .. } => for_each_sub_expr(call, f),
-        ExprKind::SvaClocked { clock, body } => {
+        ExprKind::SvaClocked { clock, iff, body, .. } => {
             for_each_sub_expr(clock, f);
+            if let Some(g) = iff {
+                for_each_sub_expr(g, f);
+            }
             for_each_sub_expr(body, f);
         }
         _ => {}
@@ -27375,8 +27378,10 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
         // would keep references to formal `in_a`/`in_b` after the
         // port-substitution pass, causing the sva site to read
         // non-existent signals.
-        ExprKind::SvaClocked { clock, body } => ExprKind::SvaClocked {
+        ExprKind::SvaClocked { clock, edge, iff, body } => ExprKind::SvaClocked {
             clock: Box::new(rewrite_expr_impl(clock, prefix, port_map, local_names, interface_map)),
+            edge: *edge,
+            iff: iff.as_ref().map(|g| Box::new(rewrite_expr_impl(g, prefix, port_map, local_names, interface_map))),
             body: Box::new(rewrite_expr_impl(body, prefix, port_map, local_names, interface_map)),
         },
         // §10.9.2: an assignment pattern is an EXPRESSION, and its items name

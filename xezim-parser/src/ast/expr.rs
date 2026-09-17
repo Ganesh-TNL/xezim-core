@@ -82,7 +82,14 @@ pub enum ExprKind {
     /// is the predicate. The executor evaluates this only at the
     /// clocking event and tracks `|=>` / `##N` cycle-delay deferral
     /// state across firings.
-    SvaClocked { clock: Box<Expression>, body: Box<Expression> },
+    /// `@(<edge> clock [iff guard]) body` (§16.5): `edge` is 0 posedge,
+    /// 1 negedge, 2 any edge.
+    SvaClocked {
+        clock: Box<Expression>,
+        edge: u8,
+        iff: Option<Box<Expression>>,
+        body: Box<Expression>,
+    },
     /// LRM §8.8: the shallow-copy constructor `new <handle>` (parentheseless
     /// `new <expr>` where `<expr>` is an object handle, footnote 23) — a
     /// shallow copy, NOT a constructor call. `new(args)` stays an ordinary

@@ -1284,21 +1284,7 @@ impl Parser {
         // cancels every attempt in flight while the guard is true.
         let clk_event = if self.at(TokenKind::At) {
             self.bump(); // @
-            let e = if self.at(TokenKind::LParen) {
-                self.bump();
-                let _ = self.eat(TokenKind::KwPosedge);
-                let _ = self.eat(TokenKind::KwNegedge);
-                let _ = self.eat(TokenKind::KwEdge);
-                let e = self.parse_expression();
-                self.expect(TokenKind::RParen);
-                e
-            } else {
-                let _ = self.eat(TokenKind::KwPosedge);
-                let _ = self.eat(TokenKind::KwNegedge);
-                let _ = self.eat(TokenKind::KwEdge);
-                self.parse_expression()
-            };
-            Some(e)
+            Some(self.parse_sva_clock_event())
         } else { None };
         let disable_guard = if self.at(TokenKind::KwDisable)
             && self.peek_kind() == TokenKind::KwIff
@@ -1342,10 +1328,12 @@ impl Parser {
             Some(Box::new(self.parse_statement()))
         } else { None };
         self.eat(TokenKind::Semicolon);
-        let expr = if let Some(clk) = clk_event {
+        let expr = if let Some((clk, edge, iff)) = clk_event {
             Expression::new(
                 ExprKind::SvaClocked {
                     clock: Box::new(clk),
+                    edge,
+                    iff: iff.map(Box::new),
                     body: Box::new(body),
                 },
                 self.span_from(start),

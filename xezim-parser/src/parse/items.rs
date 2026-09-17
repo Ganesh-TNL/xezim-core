@@ -990,19 +990,7 @@ impl Parser {
                 let body_expr = if self.at(TokenKind::At) {
                     let bstart = self.current().span.start;
                     self.bump(); // @
-                    let clk = if self.at(TokenKind::LParen) {
-                        self.bump();
-                        let _ = self.eat(TokenKind::KwPosedge);
-                        let _ = self.eat(TokenKind::KwNegedge);
-                        let _ = self.eat(TokenKind::KwEdge);
-                        let e = self.parse_expression();
-                        let _ = self.eat(TokenKind::RParen);
-                        e
-                    } else {
-                        let _ = self.eat(TokenKind::KwPosedge);
-                        let _ = self.eat(TokenKind::KwNegedge);
-                        self.parse_expression()
-                    };
+                    let (clk, clk_edge, clk_iff) = self.parse_sva_clock_event();
                     // §16.12: optional `disable iff (<expr>)` after the
                     // clocking event, before the property expression; kept
                     // as `Binary{SvaDisableIff, guard, body}`.
@@ -1038,6 +1026,8 @@ impl Parser {
                     Some(crate::ast::expr::Expression::new(
                         crate::ast::expr::ExprKind::SvaClocked {
                             clock: Box::new(clk),
+                            edge: clk_edge,
+                            iff: clk_iff.map(Box::new),
                             body: Box::new(body),
                         },
                         self.span_from(bstart),
@@ -1067,19 +1057,7 @@ impl Parser {
                 let body_expr = if self.at(TokenKind::At) {
                     let bstart = self.current().span.start;
                     self.bump();
-                    let clk = if self.at(TokenKind::LParen) {
-                        self.bump();
-                        let _ = self.eat(TokenKind::KwPosedge);
-                        let _ = self.eat(TokenKind::KwNegedge);
-                        let _ = self.eat(TokenKind::KwEdge);
-                        let e = self.parse_expression();
-                        let _ = self.eat(TokenKind::RParen);
-                        e
-                    } else {
-                        let _ = self.eat(TokenKind::KwPosedge);
-                        let _ = self.eat(TokenKind::KwNegedge);
-                        self.parse_expression()
-                    };
+                    let (clk, clk_edge, clk_iff) = self.parse_sva_clock_event();
                     self.in_sva_seq = true;
                     let body = self.parse_expression();
                     self.in_sva_seq = false;
@@ -1087,6 +1065,8 @@ impl Parser {
                     Some(crate::ast::expr::Expression::new(
                         crate::ast::expr::ExprKind::SvaClocked {
                             clock: Box::new(clk),
+                            edge: clk_edge,
+                            iff: clk_iff.map(Box::new),
                             body: Box::new(body),
                         },
                         self.span_from(bstart),

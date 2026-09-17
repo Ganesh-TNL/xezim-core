@@ -530,18 +530,43 @@ impl Parser {
                 // after a sequence operand: `[*n:m]` (consecutive), `[=n:m]`
                 // (non-consecutive), `[->n:m]` (goto). The leading `*`/`=`/`->`
                 // can't begin a normal index expression, so this is
-                // unambiguous. Parse-accept: consume to the matching `]` and
-                // leave the operand unchanged (repetition count not modelled).
+                // unambiguous. Kept as `$sva_rep_<kind>(operand, lo, hi)`;
+                // `[*]` is `[*0:$]`, `[+]` is `[*1:$]`, a lone `[*n]` is `n:n`.
                 if self.at(TokenKind::Star) || self.at(TokenKind::Assign) || self.at(TokenKind::Arrow) {
-                    let mut depth = 1i32;
-                    while depth > 0 && !self.at(TokenKind::Eof) {
-                        match self.current_kind() {
-                            TokenKind::LBracket => depth += 1,
-                            TokenKind::RBracket => depth -= 1,
-                            _ => {}
-                        }
+                    let kind = match self.current_kind() {
+                        TokenKind::Star => "$sva_rep_consec",
+                        TokenKind::Assign => "$sva_rep_noncon",
+                        _ => "$sva_rep_goto",
+                    };
+                    self.bump();
+                    let mk_num = |this: &Self, v: &str| {
+                        Expression::new(ExprKind::Number(
+                            crate::ast::expr::NumberLiteral::Integer {
+                                size: None, signed: false,
+                                base: crate::ast::expr::NumberBase::Decimal,
+                                value: v.to_string(),
+                                cached_val: std::cell::Cell::new(None),
+                            }), this.span_from(start))
+                    };
+                    let (lo, hi) = if self.at(TokenKind::RBracket) {
+                        (mk_num(self, "0"), Expression::new(ExprKind::Dollar, self.span_from(start)))
+                    } else if self.at(TokenKind::Plus) {
+                        self.bump();
+                        (mk_num(self, "1"), Expression::new(ExprKind::Dollar, self.span_from(start)))
+                    } else {
+                        let lo = self.parse_expr_bp(0);
+                        let hi = if self.eat(TokenKind::Colon).is_some() {
+                            self.parse_expr_bp(0)
+                        } else {
+                            lo.clone()
+                        };
+                        (lo, hi)
+                    };
+                    while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
                         self.bump();
                     }
+                    let _ = self.eat(TokenKind::RBracket);
+                    lhs = Self::sva_marker(kind, vec![lhs, lo, hi], self.span_from(start));
                     continue;
                 }
                 let idx = self.parse_expression();
@@ -1332,15 +1357,8 @@ impl Parser {
             }
             TokenKind::KwFirst_match => {
                 // LRM §16.9.7 `first_match(sequence_expr [, sequence_match_item…])`.
-                // The operator restricts a sequence to its FIRST match, which
-                // matters only when a later operator would otherwise see the
-                // sequence's other matches. The SVA executor here is already
-                // approximate about multi-match sequences — §16.8 cycle-delay
-                // RANGES are collapsed to their lower bound a few arms below —
-                // so the match restriction is a no-op against this engine and
-                // the operand is returned directly. That keeps the assertion
-                // PARSING and EVALUATING instead of failing elaboration, which
-                // is what `first_match(##[0:500] $fell(tx))` used to do.
+                // Kept as a `$sva_first_match(seq)` marker: the assertion
+                // engine stops the operand at its first match.
                 let start = self.current().span.start;
                 self.bump();
                 if self.eat(TokenKind::LParen).is_none() {
@@ -1367,7 +1385,7 @@ impl Parser {
                     }
                 }
                 let _ = self.eat(TokenKind::RParen);
-                seq
+                Self::sva_marker("$sva_first_match", vec![seq], self.span_from(start))
             }
             TokenKind::KwIf => {
                 // LRM §16.12.7 `if (expression_or_dist) property_expr
@@ -1417,10 +1435,24 @@ impl Parser {
                 );
                 Expression::new(
                     ExprKind::Binary {
-                        op: BinaryOp::SeqAnd,
+                        op: BinaryOp::SvaAnd,
                         left: Box::new(then_arm),
                         right: Box::new(else_arm),
                     },
+                    self.span_from(start),
+                )
+            }
+            // §16.12.2 `strong(seq)` / `weak(seq)`: kept as markers.
+            TokenKind::KwStrong | TokenKind::KwWeak => {
+                let start = self.current().span.start;
+                let strong = self.at(TokenKind::KwStrong);
+                self.bump();
+                let _ = self.eat(TokenKind::LParen);
+                let seq = self.parse_expr_bp(0);
+                let _ = self.eat(TokenKind::RParen);
+                Self::sva_marker(
+                    if strong { "$sva_strong" } else { "$sva_weak" },
+                    vec![seq],
                     self.span_from(start),
                 )
             }
@@ -1863,6 +1895,49 @@ impl Parser {
             ),
             None => lo,
         }
+    }
+
+    /// §16.5 clocking event after `@`: `(posedge clk)`, `(negedge clk iff g)`,
+    /// `(clk)` or a bare `clk`. Returns `(clock, edge, iff)` with edge 0
+    /// posedge (also the default), 1 negedge, 2 any edge.
+    pub(super) fn parse_sva_clock_event(&mut self) -> (Expression, u8, Option<Expression>) {
+        let paren = self.eat(TokenKind::LParen).is_some();
+        let edge: u8 = if self.eat(TokenKind::KwPosedge).is_some() {
+            0
+        } else if self.eat(TokenKind::KwNegedge).is_some() {
+            1
+        } else if self.eat(TokenKind::KwEdge).is_some() {
+            2
+        } else {
+            0
+        };
+        let parsed = self.parse_expression();
+        // `clk iff g` arrives as `Binary(Iff, clk, g)`: peel it apart.
+        let (clock, iff) = match parsed.kind {
+            ExprKind::Binary { op: BinaryOp::Iff, left, right } => (*left, Some(*right)),
+            other => {
+                let clock = Expression { kind: other, span: parsed.span, cached_width: std::cell::Cell::new(None) };
+                let iff = if self.eat(TokenKind::KwIff).is_some() {
+                    Some(self.parse_expression())
+                } else {
+                    None
+                };
+                (clock, iff)
+            }
+        };
+        if paren {
+            let _ = self.eat(TokenKind::RParen);
+        }
+        (clock, edge, iff)
+    }
+
+    /// Wrap a sequence in a marker the assertion engine recognises
+    /// (`$sva_rep_consec(s, lo, hi)`, `$sva_first_match(s)`, ...).
+    fn sva_marker(name: &str, args: Vec<Expression>, span: Span) -> Expression {
+        Expression::new(
+            ExprKind::SystemCall { name: name.to_string(), args },
+            span,
+        )
     }
 
     fn infix_bp(&self) -> Option<(BinaryOp, u8, u8)> {
