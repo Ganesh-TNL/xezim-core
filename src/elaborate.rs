@@ -25859,6 +25859,23 @@ pub fn duplicate_decl_error(
     m
 }
 
+/// The declared type NAME of a net or variable.
+///
+/// `signals[..].type_name` is the usual home, but a declaration inside an
+/// INSTANCE that resolves to an unpacked struct (§7.2) leaves no signal under
+/// its own name at all — `register_unpacked_aggregate` registers the member
+/// leaves and the sub-module path returns, recording the declared type in
+/// `var_decl_types` instead. A §6.6.7(d) nettype over an unpacked struct is
+/// stored that way too, so every lookup that goes only through `signals`
+/// silently misses those nets: their drivers are never gathered and their
+/// members never written, below the top level only.
+fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
+    if let Some(tn) = elab.signals.get(name).and_then(|sig| sig.type_name.clone()) {
+        return Some(tn);
+    }
+    elab.var_decl_types.get(name).and_then(get_type_name)
+}
+
 /// §6.6.7 user-defined nettype resolution, over the WHOLE elaborated design.
 ///
 /// Runs after `inline_instantiations`, so a net driven from several module
@@ -25902,23 +25919,6 @@ pub fn duplicate_decl_error(
 /// Runs after `resolve_user_nettype_drivers`, which does its own member
 /// expansion for nettype nets (it has to — the resolver call only exists there);
 /// those emerge with a `MemberAccess` lhs and are left alone.
-/// The declared type NAME of a net or variable.
-///
-/// `signals[..].type_name` is the usual home, but a declaration inside an
-/// INSTANCE that resolves to an unpacked struct (§7.2) leaves no signal under
-/// its own name at all — `register_unpacked_aggregate` registers the member
-/// leaves and the sub-module path returns, recording the declared type in
-/// `var_decl_types` instead. A §6.6.7(d) nettype over an unpacked struct is
-/// stored that way too, so every lookup that goes only through `signals`
-/// silently misses those nets: their drivers are never gathered and their
-/// members never written, below the top level only.
-fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
-    if let Some(tn) = elab.signals.get(name).and_then(|sig| sig.type_name.clone()) {
-        return Some(tn);
-    }
-    elab.var_decl_types.get(name).and_then(get_type_name)
-}
-
 pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<String>> {
         declared_type_name(elab, name)
