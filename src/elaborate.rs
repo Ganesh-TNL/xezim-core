@@ -4500,13 +4500,20 @@ pub fn elaborate_module_with_defs(
                     is_real,
                     direction: port.direction,
                     value: init_val.unwrap_or_else(|| {
-                        default_port_value(port.direction, port.data_type.as_ref(), width, is_real)
+                        default_port_value(port.direction, port.data_type.as_ref(), width, is_real, port.net_type)
                     }),
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
                 if port_shape.is_empty() {
                     signals_insert_traced(&mut elab.signals, line!(), port.name.name.clone(), sig);
+                    // Register resolved_net_kinds for pull drivers (tri0/tri1/wand/wor/etc.)
+                    if let Some(k) = ResolvedNetKind::from_net_type(port.net_type.unwrap_or(NetType::Wire)) {
+                        elab.resolved_net_kinds.insert(port.name.name.clone(), k);
+                    }
+                    if matches!(port.net_type, Some(NetType::Interconnect)) {
+                        elab.interconnect_nets.insert(port.name.name.clone());
+                    }
                     // §7.2/§23.2.2: a port whose type is an UNPACKED STRUCT is
                     // stored member-wise, exactly like a variable of the same
                     // type — the flat container above only carries the width.
@@ -5052,6 +5059,7 @@ pub fn elaborate_module_with_defs(
                                     Some(&pd.data_type),
                                     width,
                                     is_real,
+                                    pd.net_type,
                                 );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
@@ -5075,6 +5083,7 @@ pub fn elaborate_module_with_defs(
                             Some(&pd.data_type),
                             width,
                             is_real,
+                            pd.net_type,
                         ),
                         type_name: get_type_name(&pd.data_type),
                     };
@@ -5082,6 +5091,13 @@ pub fn elaborate_module_with_defs(
                         elab.port_order.push(decl.name.name.clone());
                     }
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
+                    // Register resolved_net_kinds for pull drivers (tri0/tri1/wand/wor/etc.)
+                    if let Some(k) = ResolvedNetKind::from_net_type(pd.net_type.unwrap_or(NetType::Wire)) {
+                        elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
+                    }
+                    if matches!(pd.net_type, Some(NetType::Interconnect)) {
+                        elab.interconnect_nets.insert(decl.name.name.clone());
+                    }
                     if let Some(view) = &port_modport_view {
                         elab.modport_views.insert(decl.name.name.clone(), view.clone());
                     }
@@ -5111,15 +5127,25 @@ pub fn elaborate_module_with_defs(
                     // (i.e. a true duplicate user declaration).
                     if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_some() {
-                            existing.value = match nd.net_type {
-                                NetType::Supply0 => Value::zero(existing.width),
-                                NetType::Supply1 => Value::ones(existing.width),
-                                _ => {
-                                    if existing.is_real {
-                                        Value::from_f64(0.0)
-                                    } else {
-                                        Value::all_z(existing.width)
-                                    }
+                            existing.value = if existing.is_real {
+                                Value::from_f64(0.0)
+                            } else {
+                                match nd.net_type {
+                                    NetType::Supply0 | NetType::Tri0 => Value::zero(existing.width),
+                                    NetType::Supply1 | NetType::Tri1 => Value::ones(existing.width),
+                                    // §6.6.4: a never-driven trireg reads z (not x) per 2 of Big 3
+                                    // §6.6: wand/wor/triand/trior are wired-logic nets with no pull
+                                    // uwire/interconnect cannot be read in expressions, default to z
+                                    NetType::Wire
+                                    | NetType::Tri
+                                    | NetType::Wand
+                                    | NetType::Wor
+                                    | NetType::TriAnd
+                                    | NetType::TriOr
+                                    | NetType::TriReg
+                                    | NetType::Uwire
+                                    | NetType::Interconnect => Value::all_z(existing.width),
+                                    NetType::Wreal => Value::from_f64(0.0),
                                 }
                             };
                             // §6.8: port and net signing MERGE — signed if
@@ -5130,6 +5156,13 @@ pub fn elaborate_module_with_defs(
                                 existing.is_signed = true;
                             }
                             elab.nets.insert(decl.name.name.clone());
+                            // Register resolved_net_kinds for pull drivers (tri0/tri1/wand/wor/etc.)
+                            if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
+                                elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
+                            }
+                            if matches!(nd.net_type, NetType::Interconnect) {
+                                elab.interconnect_nets.insert(decl.name.name.clone());
+                            }
                             // §10.3.1: the net declaration's initializer is a
                             // continuous assignment — it was dropped when the
                             // name was already declared as a port, leaving
@@ -5175,17 +5208,26 @@ pub fn elaborate_module_with_defs(
                     if matches!(nd.net_type, NetType::Interconnect) {
                         elab.interconnect_nets.insert(decl.name.name.clone());
                     }
-                    let init_value = match nd.net_type {
-                        NetType::Supply0 => Value::zero(w),
-                        NetType::Supply1 => Value::ones(w),
-                        // §6.6.3: an UNDRIVEN tri0/tri1 reads its pull value,
-                        // not z. A driven one is resolved in the multi-driver
-                        // fold, which overwrites this at settle.
-                        NetType::Tri0 => Value::zero(w),
-                        NetType::Tri1 => Value::ones(w),
-                        // §6.6.4: a never-driven trireg reads x (no charge yet).
-                        NetType::TriReg => Value::all_x(w),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
+                    let init_value = if is_real {
+                        Value::from_f64(0.0)
+                    } else {
+                        match nd.net_type {
+                            NetType::Supply0 | NetType::Tri0 => Value::zero(w),
+                            NetType::Supply1 | NetType::Tri1 => Value::ones(w),
+                            // §6.6.4: a never-driven trireg reads z (not x) per 2 of Big 3
+                            // §6.6: wand/wor/triand/trior are wired-logic nets with no pull
+                            // uwire/interconnect cannot be read in expressions, default to z
+                            NetType::Wire
+                            | NetType::Tri
+                            | NetType::Wand
+                            | NetType::Wor
+                            | NetType::TriAnd
+                            | NetType::TriOr
+                            | NetType::TriReg
+                            | NetType::Uwire
+                            | NetType::Interconnect => Value::all_z(w),
+                            NetType::Wreal => Value::from_f64(0.0),
+                        }
                     };
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
@@ -5530,6 +5572,7 @@ pub fn elaborate_module_with_defs(
                                     Some(&dd.data_type),
                                     width,
                                     decl_is_real,
+                                    None, // reg/logic completion makes port a variable, no net_type
                                 )
                             };
                         }
@@ -10704,6 +10747,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                     Some(&pd.data_type),
                                     width,
                                     is_real,
+                                    pd.net_type,
                                 );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
@@ -10724,10 +10768,18 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             Some(&pd.data_type),
                             width,
                             is_real,
+                            pd.net_type,
                         ),
                         is_real, type_name: get_type_name(&pd.data_type),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
+                    // Register resolved_net_kinds for pull drivers (tri0/tri1/wand/wor/etc.)
+                    if let Some(k) = ResolvedNetKind::from_net_type(pd.net_type.unwrap_or(NetType::Wire)) {
+                        elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
+                    }
+                    if matches!(pd.net_type, Some(NetType::Interconnect)) {
+                        elab.interconnect_nets.insert(decl.name.name.clone());
+                    }
                     elab.port_order.push(decl.name.name.clone());
                     if let Some(view) = &port_modport_view {
                         elab.modport_views.insert(decl.name.name.clone(), view.clone());
@@ -10745,17 +10797,26 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     if matches!(nd.net_type, NetType::Interconnect) {
                         elab.interconnect_nets.insert(decl.name.name.clone());
                     }
-                    let init_value = match nd.net_type {
-                        NetType::Supply0 => Value::zero(width),
-                        NetType::Supply1 => Value::ones(width),
-                        // §6.6.3: an UNDRIVEN tri0/tri1 reads its pull value,
-                        // not z. A driven one is resolved in the multi-driver
-                        // fold, which overwrites this at settle.
-                        NetType::Tri0 => Value::zero(width),
-                        NetType::Tri1 => Value::ones(width),
-                        // §6.6.4: a never-driven trireg reads x (no charge yet).
-                        NetType::TriReg => Value::all_x(width),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(width) },
+                    let init_value = if is_type_real(&nd.data_type) {
+                        Value::from_f64(0.0)
+                    } else {
+                        match nd.net_type {
+                            NetType::Supply0 | NetType::Tri0 => Value::zero(width),
+                            NetType::Supply1 | NetType::Tri1 => Value::ones(width),
+                            // §6.6.4: a never-driven trireg reads z (not x) per 2 of Big 3
+                            // §6.6: wand/wor/triand/trior are wired-logic nets with no pull
+                            // uwire/interconnect cannot be read in expressions, default to z
+                            NetType::Wire
+                            | NetType::Tri
+                            | NetType::Wand
+                            | NetType::Wor
+                            | NetType::TriAnd
+                            | NetType::TriOr
+                            | NetType::TriReg
+                            | NetType::Uwire
+                            | NetType::Interconnect => Value::all_z(width),
+                            NetType::Wreal => Value::from_f64(0.0),
+                        }
                     };
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
@@ -13393,15 +13454,42 @@ fn default_value_for_type(dt: &DataType, width: u32) -> Value {
     if is_type_two_state(dt) { Value::zero(width) } else { Value::new(width) }
 }
 
+/// Returns the default value for a port, considering its net_type (if any).
+/// Per IEEE 1800-2017 §6.6 and §23.2.2.4:
+/// - Net types with pulls (supply0, supply1, tri0, tri1) return their pull value
+/// - Other net types (wire, tri, wand, wor, triand, trior, trireg, uwire, interconnect) return z
+/// - Variable ports (no net_type): input/inout return z (or 0 for 2-state), output returns x
 fn default_port_value(
     direction: Option<PortDirection>,
     data_type: Option<&DataType>,
     width: u32,
     is_real: bool,
+    net_type: Option<NetType>,
 ) -> Value {
     if is_real {
         return Value::from_f64(0.0);
     }
+    // If the port has a net_type, use the net type's default value
+    if let Some(nt) = net_type {
+        return match nt {
+            NetType::Supply0 | NetType::Tri0 => Value::zero(width),
+            NetType::Supply1 | NetType::Tri1 => Value::ones(width),
+            // §6.6.4: a never-driven trireg reads z (not x) per xrun golden reference
+            // §6.6: wand/wor/triand/trior are wired-logic nets with no pull
+            // uwire/interconnect cannot be read in expressions, default to z
+            NetType::Wire
+            | NetType::Tri
+            | NetType::Wand
+            | NetType::Wor
+            | NetType::TriAnd
+            | NetType::TriOr
+            | NetType::TriReg
+            | NetType::Uwire
+            | NetType::Interconnect => Value::all_z(width),
+            NetType::Wreal => Value::from_f64(0.0),
+        };
+    }
+    // Variable port (no net_type): use direction-based default
     if matches!(direction, Some(PortDirection::Input | PortDirection::Inout)) {
         if data_type.map(is_type_two_state).unwrap_or(false) {
             Value::zero(width)
@@ -13409,7 +13497,7 @@ fn default_port_value(
             Value::all_z(width)
         }
     } else {
-        Value::new(width)
+        Value::new(width) // x for output variable ports
     }
 }
 
@@ -22950,6 +23038,7 @@ fn inline_module_items(
                                     direction: port.direction,
                                     value: init_val.unwrap_or_else(|| default_port_value(
                                         port.direction, port.data_type.as_ref(), width, is_real,
+                                        port.net_type,
                                     )),
                                     type_name: port.data_type.as_ref().and_then(get_type_name),
                                 });
@@ -23022,6 +23111,7 @@ fn inline_module_items(
                                             Some(&pd.data_type),
                                             width,
                                             port_is_real,
+                                            pd.net_type,
                                         ),
                                         is_real: port_is_real, type_name: scope_local_type_name(get_type_name(&pd.data_type), &sub_typedef_names_all, &inst_prefix),
                                     });
@@ -23318,17 +23408,31 @@ fn inline_module_items(
                                 if matches!(nd.net_type, NetType::Interconnect) {
                         elab.interconnect_nets.insert(decl.name.name.clone());
                     }
-                    let init_value = match nd.net_type {
-                                    NetType::Supply0 => Value::zero(width),
-                                    NetType::Supply1 => Value::ones(width),
-                                    _ => {
-                                        if is_type_real(&nd.data_type) {
-                                            Value::from_f64(0.0)
-                                        } else {
-                                            Value::all_z(width)
-                                        }
-                                    }
-                                };
+                    // Register resolved_net_kinds for pull drivers (tri0/tri1/wand/wor/etc.)
+                    if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
+                        elab.resolved_net_kinds.insert(sig_name.clone(), k);
+                    }
+                    let init_value = if is_type_real(&nd.data_type) {
+                        Value::from_f64(0.0)
+                    } else {
+                        match nd.net_type {
+                            NetType::Supply0 | NetType::Tri0 => Value::zero(width),
+                            NetType::Supply1 | NetType::Tri1 => Value::ones(width),
+                            // §6.6.4: a never-driven trireg reads z (not x) per xrun golden reference
+                            // §6.6: wand/wor/triand/trior are wired-logic nets with no pull
+                            // uwire/interconnect cannot be read in expressions, default to z
+                            NetType::Wire
+                            | NetType::Tri
+                            | NetType::Wand
+                            | NetType::Wor
+                            | NetType::TriAnd
+                            | NetType::TriOr
+                            | NetType::TriReg
+                            | NetType::Uwire
+                            | NetType::Interconnect => Value::all_z(width),
+                            NetType::Wreal => Value::from_f64(0.0),
+                        }
+                    };
                                 signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: is_type_signed(&nd.data_type),
@@ -23671,6 +23775,7 @@ fn inline_module_items(
                                             Some(&dd.data_type),
                                             width,
                                             decl_is_real,
+                                            None, // reg/logic completion makes port a variable, no net_type
                                         );
                                     }
                                     if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
