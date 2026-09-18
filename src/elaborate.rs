@@ -22929,17 +22929,28 @@ fn inline_module_items(
                                 if let Some(dt) = &port.data_type {
                                     register_unpacked_aggregate(elab, &sig_name, dt);
                                 }
+                                // §23.2.2.4: an output-variable default is its
+                                // declaration initializer.  Inlined instances
+                                // must preserve it just as the root module does.
+                                let init_val = match (&port.direction, &port.default) {
+                                    (Some(PortDirection::Output), Some(def)) => {
+                                        let v = eval_const_expr(def, &sub_merged_params);
+                                        Some(if is_real {
+                                            Value::from_f64(v as f64)
+                                        } else {
+                                            Value::from_u64(v, width).resize(width)
+                                        })
+                                    }
+                                    _ => None,
+                                };
                                 signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: port.data_type.as_ref().map(is_type_signed).unwrap_or(false),
                                     is_real,
                                     direction: port.direction,
-                                    value: default_port_value(
-                                        port.direction,
-                                        port.data_type.as_ref(),
-                                        width,
-                                        is_real,
-                                    ),
+                                    value: init_val.unwrap_or_else(|| default_port_value(
+                                        port.direction, port.data_type.as_ref(), width, is_real,
+                                    )),
                                     type_name: port.data_type.as_ref().and_then(get_type_name),
                                 });
                             } else {

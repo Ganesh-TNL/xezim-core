@@ -1494,6 +1494,16 @@ impl Parser {
                         | TokenKind::LParen
                         | TokenKind::IntegerLiteral
                         | TokenKind::HashHash
+                        | TokenKind::Plus
+                        | TokenKind::Minus
+                        | TokenKind::LogNot
+                        | TokenKind::BitNot
+                        | TokenKind::BitAnd
+                        | TokenKind::BitOr
+                        | TokenKind::BitXor
+                        | TokenKind::BitNand
+                        | TokenKind::BitNor
+                        | TokenKind::BitXnor
                 );
                 if allow_rhs {
                     let rest = self.parse_expr_bp(3);

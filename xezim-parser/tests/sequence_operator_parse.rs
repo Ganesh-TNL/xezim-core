@@ -89,6 +89,12 @@ fn fixed_delay_then_sampled_value_parses() {
 }
 
 #[test]
+fn fixed_delay_then_unary_expression_parses() {
+    let e = errors(&prop("req |-> (##1 !ack)"));
+    assert!(e.is_empty(), "a delayed unary expression must parse, got: {:?}", e);
+}
+
+#[test]
 fn stability_across_a_delayed_sampled_value_parses() {
     // `throughout` over a delayed sampled value: valid-and-stable until ready.
     let e = errors(&prop(
