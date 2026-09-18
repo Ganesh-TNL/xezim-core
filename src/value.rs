@@ -4032,6 +4032,82 @@ mod tests {
         assert_eq!(Value::from_str_radix("zz", 16, 8).to_bin(), "zzzzzzzz");
     }
 
+    // A decimal literal wider than u64 used to read 0: `from_str_radix`'s
+    // narrow `u64::from_str_radix` fast path fails on it, and the wide path
+    // only handled the power-of-two radices and gave up on radix 10. Malformed
+    // input has to read all-X like the narrow path does, not as whatever the
+    // leading digits happen to spell.
+    #[test]
+    fn test_decimal_wide_and_malformed() {
+        let d = |s: &str, w: u32| Value::from_str_radix(s, 10, w).to_hex();
+
+        // The exact boundary: 2^63 still fits u64, 2^64 does not and used to
+        // come back all-zero at every width.
+        assert_eq!(d("9223372036854775808", 64), "8000000000000000");
+        assert_eq!(d("18446744073709551616", 65), "10000000000000000");
+
+        // Truncation is the mod-2^width wrap §5.7.1 gives an oversized
+        // literal, so a value that no integer type can hold is still exact.
+        assert_eq!(d("18446744073709551616", 64), "0000000000000000");
+        assert_eq!(d("18446744073709551616", 32), "00000000");
+        assert_eq!(d("99999999999999999999999999", 64), "dcc80cd2e3ffffff");
+
+        // Past 128 bits the digits are folded straight into limbs, so these
+        // exercise the limb accumulator rather than the u128 one.
+        assert_eq!(
+            d("340282366920938463463374607431768211456", 160),
+            "0000000100000000000000000000000000000000"
+        );
+        assert_eq!(
+            d("680564733841876926926749214863536422912", 160),
+            "0000000200000000000000000000000000000000"
+        );
+        assert_eq!(
+            d("1234567890123456789012345678901234567890", 160),
+            "00000003a0c92075c0dbf3b8acbc5f96ce3f0ad2"
+        );
+
+        // Exactly the u128 accumulator's ceiling: reducing mod 2^128 and then
+        // to the width is the same as reducing once, so wrapping stays exact.
+        assert_eq!(d("340282366920938463463374607431768211456", 128), "0".repeat(32));
+        assert_eq!(d("340282366920938463463374607431768211457", 128), format!("{}1", "0".repeat(31)));
+
+        // Underscores are separators, not digits, and are stripped upstream.
+        assert_eq!(d("18_446_744_073_709_551_616", 65), "10000000000000000");
+
+        // Malformed decimal reads all-X at any width, matching what the narrow
+        // path already answers — `12ab` must not quietly become `12`.
+        let is_all_x = |s: &str, w: u32| {
+            let v = Value::from_str_radix(s, 10, w);
+            (0..w).all(|b| v.get_bit(b as usize) == LogicBit::X)
+        };
+        assert!(is_all_x("12ab", 32), "trailing junk is not a number");
+        assert!(is_all_x("12ab", 160), "same answer past 64 bits, not 12");
+        assert!(is_all_x("-12", 64), "sign is the caller's to apply");
+        assert!(is_all_x("-12", 160), "same answer past 64 bits");
+        assert!(is_all_x("", 64), "no digits at all");
+        assert!(is_all_x("___", 64), "underscores alone are not a number");
+        assert!(is_all_x("+", 64), "a bare sign has no magnitude");
+
+        // A leading `+` is a no-op, and `u64::from_str_radix` already tolerates
+        // one — the wide path has to agree or `+12` and `+<big>` would answer
+        // differently for the same reason.
+        assert_eq!(d("+12", 64), "000000000000000c");
+        assert_eq!(d("+18446744073709551616", 65), "10000000000000000");
+
+        // Storage must follow the width split — an Inline and a Wide holding
+        // the same bits are never `==`, so a wide literal has to compare equal
+        // to the same value built any other way.
+        assert_eq!(
+            Value::from_str_radix("18446744073709551616", 10, 65),
+            Value::from_u128(1u128 << 64, 65)
+        );
+        assert_eq!(
+            Value::from_str_radix("18446744073709551616", 10, 64),
+            Value::zero(64)
+        );
+    }
+
     // §21.2.1.2 unknown-value casing for `%h` and `%d` (matches a reference simulator): an
     // all-x group prints lowercase `x`, all-z prints `z`, and a group MIXING
     // unknown with known bits (or x with z) prints uppercase `X`/`Z`. The old
@@ -4522,8 +4598,9 @@ impl Value {
             // Wide value: parse digit-by-digit for radices that are powers of 2.
             let bits_per_digit = match radix { 2 => 1, 8 => 3, 16 => 4, _ => 0 };
             if bits_per_digit == 0 {
-                // Decimal wide number not supported here; fall back to zero.
-                return Self::zero(width);
+                // Decimal with no power-of-two digit decomposition: accumulate
+                // the digits rather than giving up and reading 0.
+                return Self::from_decimal_str(&s, width);
             }
             let mut val = Self::zero(width);
             for (i, ch) in s.chars().rev().enumerate() {
@@ -4537,6 +4614,80 @@ impl Value {
                 }
             }
             val
+        }
+    }
+
+    /// Parse an unsigned decimal magnitude into a `Value` of `width`.
+    ///
+    /// `from_str_radix` hands this whatever its `u64::from_str_radix` fast
+    /// path rejects — a decimal literal too wide for `u64`, or simply wider
+    /// than the destination. Radix 2/8/16 read their bits straight out of the
+    /// digits; decimal has no such decomposition, so the value is built as
+    /// little-endian u64 limbs by multiply-accumulate and truncated to `width`
+    /// on the way in. That truncation is the mod-2^`width` wrap §5.7.1
+    /// prescribes for an oversized literal, and it is what makes the u128
+    /// accumulator case exact rather than merely wrapping: reducing mod 2^128
+    /// and then mod 2^`width` is the same as reducing once, because `width`
+    /// never exceeds 128 there.
+    ///
+    /// A string with no digits in it, or with anything besides `[0-9]`, is
+    /// malformed and reads all-X — the answer `from_str_radix`'s
+    /// malformed-decimal branch already gives. The narrow path rejects those
+    /// inputs outright, so answering the same way here keeps `'d12ab` from
+    /// quietly reading as `12` into a 160-bit destination while it reads X
+    /// into a 32-bit one. A leading `+` is tolerated because
+    /// `u64::from_str_radix` tolerates one — the two paths must not disagree
+    /// about the same text. A leading `-` is rejected outright: the callers
+    /// that accept a sign (`$sscanf`, `$value$plusargs`) peel it off and apply
+    /// it at the destination width themselves, so `-5` arriving here is a
+    /// caller bug, and answering `5` is the one reply that would hide it.
+    fn from_decimal_str(s: &str, width: u32) -> Value {
+        let width = Self::cap_width(width);
+        let digits = s.strip_prefix('+').unwrap_or(s);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Self::new(width);
+        }
+        if width <= 128 {
+            let mut acc: u128 = 0;
+            for b in digits.bytes() {
+                acc = acc.wrapping_mul(10).wrapping_add((b - b'0') as u128);
+            }
+            if width <= 64 {
+                return Self::from_u64(acc as u64, width);
+            }
+            return Self::from_u128(acc, width);
+        }
+        // Wider than the accumulator: exactly one pass over the digits,
+        // limbs = limbs * 10 + digit. The limb vector is sized to `width`, so
+        // a carry out of the top word is the truncation and is dropped, and a
+        // forty-digit literal costs no more than a short one.
+        let mut limbs = vec![0u64; WidePlanes::nwords(width)];
+        for b in digits.bytes() {
+            let mut carry = 0u64;
+            for w in limbs.iter_mut() {
+                let prod = (*w as u128) * 10 + carry as u128;
+                *w = prod as u64;
+                carry = (prod >> 64) as u64;
+            }
+            let mut carry = (b - b'0') as u64;
+            for w in limbs.iter_mut() {
+                let sum = (*w as u128) + carry as u128;
+                *w = sum as u64;
+                carry = (sum >> 64) as u64;
+                // Remaining words are unchanged.
+                if carry == 0 {
+                    break;
+                }
+            }
+        }
+        // Mirror the storage split every other constructor makes: an
+        // `Inline` and a `Wide` holding the same bits are never `==`.
+        Value {
+            storage: ValueStorage::Wide(Box::new(WidePlanes::from_val_words(&limbs, width))),
+            width,
+            is_signed: false,
+            is_real: false,
+            is_fill: false,
         }
     }
 
