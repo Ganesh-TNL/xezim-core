@@ -893,6 +893,20 @@ impl Value {
         self.is_fill = false;
     }
 
+    #[inline(always)]
+    fn repeated_word(bits: u64, width: u32) -> Option<u64> {
+        match width {
+            1 => Some(0u64.wrapping_sub(bits & 1)),
+            2 => Some((bits & 0x3).wrapping_mul(0x5555_5555_5555_5555)),
+            4 => Some((bits & 0xf).wrapping_mul(0x1111_1111_1111_1111)),
+            8 => Some((bits & 0xff).wrapping_mul(0x0101_0101_0101_0101)),
+            16 => Some((bits & 0xffff).wrapping_mul(0x0001_0001_0001_0001)),
+            32 => Some((bits & 0xffff_ffff).wrapping_mul(0x0000_0001_0000_0001)),
+            64 => Some(bits),
+            _ => None,
+        }
+    }
+
     /// `{n{self}}`: `n` copies of this value, MSB-first like `concat_refs`.
     /// A one-bit source is a fill; a source of at most 64 bits is laid down
     /// a word at a time from its period; anything wider takes the general
@@ -918,29 +932,39 @@ impl Value {
         let m = Self::mask(self.width);
         let (sv, sx) = (sv & m, sx & m);
         let nw = WidePlanes::nwords(total);
-        let (mut val, mut xz) = (vec![0u64; nw], vec![0u64; nw]);
-        // Each output word collects the copies overlapping it: copy k
-        // occupies bits [k*w, k*w+w).
-        for wi in 0..nw {
-            let base = wi * 64;
-            let end = (base + 64).min(total as usize);
-            let mut k = base / w;
-            let (mut ov, mut ox) = (0u64, 0u64);
-            while k * w < end {
-                let pos = k * w;
-                if pos >= base {
-                    let sh = pos - base;
-                    ov |= sv << sh;
-                    ox |= sx << sh;
-                } else {
-                    let sh = base - pos;
-                    ov |= sv >> sh;
-                    ox |= sx >> sh;
+        let (mut val, mut xz);
+        if let (Some(vw), Some(xw)) = (
+            Self::repeated_word(sv, self.width),
+            Self::repeated_word(sx, self.width),
+        ) {
+            val = vec![vw; nw];
+            xz = vec![xw; nw];
+        } else {
+            val = vec![0u64; nw];
+            xz = vec![0u64; nw];
+            // Each output word collects the copies overlapping it: copy k
+            // occupies bits [k*w, k*w+w).
+            for wi in 0..nw {
+                let base = wi * 64;
+                let end = (base + 64).min(total as usize);
+                let mut k = base / w;
+                let (mut ov, mut ox) = (0u64, 0u64);
+                while k * w < end {
+                    let pos = k * w;
+                    if pos >= base {
+                        let sh = pos - base;
+                        ov |= sv << sh;
+                        ox |= sx << sh;
+                    } else {
+                        let sh = base - pos;
+                        ov |= sv >> sh;
+                        ox |= sx >> sh;
+                    }
+                    k += 1;
                 }
-                k += 1;
+                val[wi] = ov;
+                xz[wi] = ox;
             }
-            val[wi] = ov;
-            xz[wi] = ox;
         }
         if total <= 64 {
             let m = Self::mask(total);
@@ -3327,6 +3351,18 @@ mod tests {
             assert_eq!(r.width, c.width);
             for i in 0..r.width as usize {
                 assert_eq!(r.get_bit(i), c.get_bit(i), "3-bit n={n} bit {i}");
+            }
+        }
+        for width in [2u32, 4, 8, 16, 32, 64] {
+            let mut tiled = Value::from_u64(0xa5a5_a5a5_a5a5_a5a5, width);
+            tiled.set_bit((width / 2) as usize, LogicBit::Z);
+            for n in [1usize, 2, 3, 17, 65] {
+                let r = tiled.replicate(n);
+                let c = Value::concat_refs(std::iter::repeat_n(&tiled, n));
+                assert_eq!(r.width, c.width);
+                for i in 0..r.width as usize {
+                    assert_eq!(r.get_bit(i), c.get_bit(i), "{width}-bit n={n} bit {i}");
+                }
             }
         }
         for n in [1usize, 2, 3, 9] {
