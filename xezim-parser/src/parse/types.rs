@@ -731,15 +731,25 @@ impl Parser {
                 // bracket immediately; otherwise rewind and treat it as a
                 // regular expression/range dimension.
                 let save_pos = self.pos;
+                let save_diags = self.diagnostics.len();
                 let dt = self.parse_data_type();
-                if self.at(TokenKind::RBracket) {
+                if self.at(TokenKind::RBracket) && self.diagnostics.len() == save_diags {
                     self.expect(TokenKind::RBracket);
                     dims.push(UnpackedDimension::Associative {
                         data_type: Some(Box::new(dt)),
                         span: self.span_from(start),
                     });
                 } else {
+                    // Rewind the position AND the diagnostics the speculative
+                    // parse emitted. On `[pkg::LIM[3]]` the data-type parse
+                    // consumes `pkg::LIM`, then treats `[3]` as packed
+                    // dimensions and reports "expected Colon" / "expected
+                    // expression" — errors that survived the position rewind
+                    // and failed the whole file even though the expression
+                    // re-parse below succeeds. Same snapshot/truncate
+                    // convention as the speculative parses in items.rs.
                     self.pos = save_pos;
+                    self.diagnostics.truncate(save_diags);
                     let expr = self.parse_expression();
                     if self.eat(TokenKind::Colon).is_some() {
                         let right = self.parse_expression();

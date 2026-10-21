@@ -4935,6 +4935,33 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                 for assign in assignments {
                     let Some(init) = &assign.init else { continue };
+                    // §6.20.2/§26.3: an UNPACKED-ARRAY package parameter
+                    // (`localparam int unsigned LIM [4] = '{1,2,4,8};`). The
+                    // scalar fold below collapses the whole pattern to one
+                    // value, so a scoped element reference
+                    // (`int mem [pkg::LIM[3]]`) read a garbage bit and a
+                    // dimension sized by it vanished. Register each element
+                    // under the SCOPED key (`pkg::LIM[i]` — the same
+                    // spelling `alias_pkg_param` uses) via the same
+                    // `register_array_param` the module body uses. Bare
+                    // visibility stays owned by the import machinery
+                    // (§26.2.2), exactly like the scalar alias below.
+                    if !assign.dimensions.is_empty() {
+                        let params_snapshot = elab.parameters.clone();
+                        let scoped_name = format!("{}::{}", p.name.name, assign.name.name);
+                        if register_array_param(
+                            &mut *elab,
+                            "",
+                            &scoped_name,
+                            &assign.dimensions,
+                            assign.init.as_ref(),
+                            None,
+                            data_type,
+                            &params_snapshot,
+                        ) {
+                            continue;
+                        }
+                    }
                     let width = if is_implicit {
                         untyped_param_width(init, &elab.parameters).unwrap_or(32)
                     } else {
@@ -19608,6 +19635,38 @@ fn const_eval_user_call(
     eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
 }
 
+/// Candidate ENV KEYS for the base of a constant `base[index]` element
+/// select. `register_array_param` stores each element of an unpacked-array
+/// parameter under `base[idx]`: bare (`LIM[i]`) at module scope, scoped
+/// (`pkg::LIM[i]`, the `alias_pkg_param` spelling) for package parameters,
+/// dotted (`u.mod.A[i]`) for inlined instances. A scoped reference parses
+/// either as a multi-segment Ident or as a MemberAccess, so enumerate the
+/// `::` and `.` spellings (bare leaf last, matching the existing bare-leaf
+/// fallback for Ident bases).
+fn const_index_base_keys(e: &Expression, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+            let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+            if segs.len() > 1 {
+                out.push(segs.join("::"));
+                out.push(segs.join("."));
+            }
+            if let Some(last) = segs.last() {
+                out.push((*last).to_string());
+            }
+        }
+        ExprKind::MemberAccess { expr, member } => {
+            let mut subs = Vec::new();
+            const_index_base_keys(expr, &mut subs);
+            for s in subs {
+                out.push(format!("{}::{}", s, member.name));
+                out.push(format!("{}.{}", s, member.name));
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn const_eval_i64_with_params(
     expr: &Expression,
     params: Option<&HashMap<String, Value>>,
@@ -19657,6 +19716,36 @@ pub fn const_eval_i64_with_params(
                         .or_else(|| p.get(&format!("{}::{}", base_name, member.name)))
                 })
                 .and_then(|v| v.to_i64())
+        }
+        // §6.20.2/§26.3: element of an UNPACKED-ARRAY parameter in a
+        // constant context — `pkg::LIM[3]`, `LIM[1]`, `u.mod.A[2]`.
+        // `register_array_param` stores each element under `base[idx]`
+        // (scoped `pkg::LIM[i]` for package arrays, bare `LIM[i]` at module
+        // scope, dotted for inlined instances), but this i64 evaluator had
+        // no Index arm at all: a dimension sized by an array element
+        // (`int mem [pkg::LIM[3]]`) evaluated 0 and the array silently
+        // vanished. Try the qualified spellings of the base first, then the
+        // Value evaluator's packed bit-/element-select for bases that
+        // actually resolve.
+        ExprKind::Index { expr: base, index } => {
+            // §6.20.2/§26.3: element of an UNPACKED-ARRAY parameter —
+            // `pkg::LIM[3]`, `LIM[1]`, `u.mod.A[2]`. register_array_param
+            // stores each element under `base[idx]` (scoped `pkg::LIM[i]`
+            // for package arrays, bare `LIM[i]` at module scope, dotted for
+            // inlined instances). Try those env keys first; everything else
+            // keeps the former `Index | MemberAccess` tail below (delegate
+            // to the full value evaluator).
+            if let Some(idx) = const_eval_i64_with_params(index, params) {
+                let mut keys = Vec::new();
+                const_index_base_keys(base, &mut keys);
+                for k in &keys {
+                    if let Some(v) = params.and_then(|p| p.get(&format!("{}[{}]", k, idx))) {
+                        return v.to_i64();
+                    }
+                }
+            }
+            let p = params?;
+            eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
         }
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
             let r = match base {
@@ -20301,7 +20390,9 @@ pub fn const_eval_i64_with_params(
         // (which carries the array-elem / struct-layout / package-param TLS
         // context) and reduce to i64. Without this, such a dimension underflows
         // to ~u32::MAX (black-parrot config widths used directly in a range).
-        ExprKind::Index { .. } | ExprKind::MemberAccess { .. } => {
+        // (`Index` moved to the dedicated arm above, which tries the
+        // unpacked-array element env keys first.)
+        ExprKind::MemberAccess { .. } => {
             let p = params?;
             eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
         }
@@ -25043,6 +25134,19 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         ExprKind::Index { expr: base, index } => {
             let base_val = eval_const_expr_val(base, params);
             let idx = eval_const_expr_val(index, params).to_u64().unwrap_or(0);
+            // §26.3: a SCOPED base (`pkg::LIM[3]`, `inst.mod.A[2]`) —
+            // `register_array_param` stores package array elements under
+            // the qualified `pkg::LIM[i]` key. Try the qualified spellings
+            // before the bare-leaf lookup below.
+            {
+                let mut keys = Vec::new();
+                const_index_base_keys(base, &mut keys);
+                for k in &keys {
+                    if let Some(ev) = params.get(&format!("{}[{}]", k, idx)) {
+                        return ev.clone();
+                    }
+                }
+            }
             if let ExprKind::Ident(h) = &base.kind {
                 let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                 // §6.20.2: element of an unpacked-array parameter — stored in
