@@ -34008,6 +34008,49 @@ fn inline_module_items(
                 );
                 iprof_since("prepare_module_items", __tp);
 
+                // §6.20.2 / §23.10 / §25: an unpacked-array BODY parameter or
+                // localparam of this instance (`localparam int unsigned LA [3]
+                // = '{7, 8, 9};` in the child module's — or interface's —
+                // body). The header site above registered header params under
+                // the instance prefix, but body declarations were only folded
+                // to ONE scalar by add_params_from_items, so a hierarchical
+                // `u.LA[1]` read a bit of the folded pattern and `$size(u.LA)`
+                // saw no shape. Register each element under the
+                // instance-prefixed key, mirroring the header site; the scalar
+                // fold stays in sub_local_params for the child's own
+                // const-eval. Runs for the top module too (prefix ""), where
+                // it re-registers what the module-body pass already recorded.
+                for it in sub_mod.items() {
+                    let (ModuleItem::ParameterDeclaration(pd)
+                    | ModuleItem::LocalparamDeclaration(pd)) = it
+                    else {
+                        continue;
+                    };
+                    let ParameterKind::Data {
+                        data_type,
+                        assignments,
+                    } = &pd.kind
+                    else {
+                        continue;
+                    };
+                    for assign in assignments {
+                        if assign.dimensions.is_empty() {
+                            continue;
+                        }
+                        let snapshot = sub_local_params.clone();
+                        register_array_param(
+                            elab,
+                            &inst_prefix,
+                            &assign.name.name,
+                            &assign.dimensions,
+                            assign.init.as_ref(),
+                            None,
+                            data_type,
+                            &snapshot,
+                        );
+                    }
+                }
+
                 // Inline all resolved parameters into global map with prefix
                 for (name, val) in &sub_local_params {
                     let full_name = cat2(&inst_prefix, &name);
