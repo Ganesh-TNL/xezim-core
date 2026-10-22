@@ -2710,6 +2710,32 @@ fn elaborate_class_in_scope(
                 property_types
                     .entry(a.name.name.clone())
                     .or_insert_with(|| data_type.clone());
+                // §6.20.2/§8.25 (issue #423): a header VALUE parameter
+                // declared with UNPACKED dimensions (`class C #(int unsigned
+                // TBL [4] = '{1, 2, 3, 4})`) is a constant ARRAY whose
+                // elements every specialization binds for itself — from its
+                // own `#(...)` argument when given, else this initializer.
+                // The scalar fold above stays (default lookups, instance
+                // property seeding); register the declared shape and the
+                // re-evaluable initializer exactly the way a class-body
+                // localparam array registers (the ClassItem::Parameter loop
+                // below), so the runtime can materialize the
+                // per-specialization elements for `C#(..)::TBL[i]` and bare
+                // `TBL[i]` reads inside static methods. No `properties`
+                // entry: a value parameter is bound as an INSTANCE property
+                // at construction (§8.25), and the class-scope read path
+                // materializes its own per-spec storage.
+                if !a.dimensions.is_empty() {
+                    if let Some((lo, hi)) =
+                        const_unpacked_bounds(&a.dimensions, unpacked_params)
+                    {
+                        let ew = resolve_type_width(data_type, Some(const_scope), None).max(1);
+                        array_properties.insert(a.name.name.clone(), (lo, hi, ew));
+                        if let Some(init) = &a.init {
+                            property_inits.insert(a.name.name.clone(), init.clone());
+                        }
+                    }
+                }
             }
         }
     }
